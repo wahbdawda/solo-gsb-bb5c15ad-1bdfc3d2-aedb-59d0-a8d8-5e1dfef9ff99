@@ -7,6 +7,7 @@
 - 全部分片校验通过后才**原子合并**（临时文件 + `rename`）为目标文件
 - 完成的文件可直接 **GET 下载**：支持完整下载与单段 `Range`（断点续传），携带以整文件 SHA-256 生成的强 **ETag**
 - 查询接口实时返回**缺失分片列表**与会话状态
+- **空闲租约（lease）自动回收**：会话空闲超时后由后台任务和启动恢复扫描标记为 `expired`，删除其分片；过期会话不可再上传或合并（`410 Gone`）
 - 元数据存 SQLite、分片存磁盘，**服务重启后可继续未完成会话**
 - 启动时自动初始化存储目录，默认监听 **8000** 端口
 
@@ -29,10 +30,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### 环境变量
 
-| 变量       | 默认值   | 说明                                   |
-| ---------- | -------- | -------------------------------------- |
-| `DATA_DIR` | `./data` | 存储根目录（SQLite、分片、成品文件）   |
-| `PORT`     | `8000`   | 监听端口（文档用途，以启动参数为准）   |
+| 变量                           | 默认值   | 说明                                                                                                |
+| ------------------------------ | -------- | --------------------------------------------------------------------------------------------------- |
+| `DATA_DIR`                     | `./data` | 存储根目录（SQLite、分片、成品文件）                                                                |
+| `PORT`                         | `8000`   | 监听端口（文档用途，以启动参数为准）                                                                |
+| `DEFAULT_IDLE_TIMEOUT_SECONDS` | `86400`  | 创建会话未指定 `idle_timeout_seconds` 时的默认空闲租约（秒），单会话上限 `604800`（7 天）           |
+| `REAPER_INTERVAL_SECONDS`      | `300`    | 后台回收任务扫描间隔（秒）；设为 `0` 关闭后台扫描（启动恢复扫描仍执行）                             |
 
 存储布局（`DATA_DIR` 下）：
 
@@ -48,8 +51,8 @@ data/
 | 方法   | 路径                                  | 说明                     |
 | ------ | ------------------------------------- | ------------------------ |
 | POST   | `/uploads`                            | 创建上传会话             |
-| PUT    | `/uploads/{id}/chunks/{index}`        | 上传一个分片（原始字节） |
-| GET    | `/uploads/{id}`                       | 查询状态与缺失分片       |
+| PUT    | `/uploads/{id}/chunks/{index}`        | 上传一个分片（原始字节；会话过期返回 `410`） |
+| GET    | `/uploads/{id}`                       | 查询状态与缺失分片（同时刷新空闲租约） |
 | POST   | `/uploads/{id}/complete`              | 校验并原子合并           |
 | GET    | `/uploads/{id}/content`               | 下载成品文件（支持 Range） |
 | GET    | `/uploads`                            | 列出所有会话             |
@@ -65,11 +68,14 @@ curl -X POST http://localhost:8000/uploads \
         "filename": "video.mp4",
         "total_size": 2109497,
         "chunk_size": 1048576,
-        "file_sha256": "<可选：整文件 SHA-256，合并时校验>"
+        "file_sha256": "<可选：整文件 SHA-256，合并时校验>",
+        "idle_timeout_seconds": 86400
       }'
 ```
 
-响应（`201`）中包含 `session_id`、推导出的 `total_chunks` 与初始 `missing_chunks`：
+`idle_timeout_seconds` 为**空闲租约**：默认 `86400`（1 天），取值范围 `1`～`604800`（7 天）。每次成功上传分片或查询状态都会刷新 `last_activity`；超过该时长没有活动且仍为 `uploading` 的会话会被自动回收。
+
+响应（`201`）中包含 `session_id`、推导出的 `total_chunks`、初始 `missing_chunks` 以及租约信息：
 
 ```json
 {
@@ -78,9 +84,22 @@ curl -X POST http://localhost:8000/uploads \
   "total_chunks": 3,
   "chunk_size": 1048576,
   "received_count": 0,
-  "missing_chunks": [0, 1, 2]
+  "missing_chunks": [0, 1, 2],
+  "idle_timeout_seconds": 86400,
+  "last_activity": "2026-09-21T10:00:00.000+00:00",
+  "expires_at": "2026-09-22T10:00:00.000+00:00",
+  "expired_at": null
 }
 ```
+
+租约相关字段：
+
+| 字段                   | 说明                                                                 |
+| ---------------------- | -------------------------------------------------------------------- |
+| `idle_timeout_seconds` | 本会话的空闲超时秒数                                                 |
+| `last_activity`        | 最近一次活动时间（创建 / 成功上传分片 / 查询状态）                   |
+| `expires_at`           | 当前租约到期时间（仅 `uploading` 会话有值，其余状态为 `null`）       |
+| `expired_at`           | 被回收的时间（仅 `expired` 会话有值）                                |
 
 ### 2. 上传分片（乱序 / 重试均可）
 
@@ -110,9 +129,49 @@ curl http://localhost:8000/uploads/$SID
   "status": "uploading",
   "received_count": 2,
   "missing_chunks": [1],
-  "total_chunks": 3
+  "total_chunks": 3,
+  "idle_timeout_seconds": 86400,
+  "last_activity": "2026-09-21T10:05:00.000+00:00",
+  "expires_at": "2026-09-22T10:05:00.000+00:00",
+  "expired_at": null
 }
 ```
+
+> 查询仍处于 `uploading` 的会话算作一次活动，会把 `last_activity` / `expires_at` 顺延一个租约周期——因此客户端正常轮询续传时不会被误回收。`completed` 与 `expired` 会话查询时不刷新租约。
+
+### 会话过期与自动回收（租约）
+
+- 会话在 `last_activity + idle_timeout_seconds` 之后仍为 `uploading` 即视为空闲超时
+- 回收有两个触发时机：
+  1. **后台定时任务**：每 `REAPER_INTERVAL_SECONDS`（默认 300 秒）扫描一次
+  2. **启动恢复扫描**：服务每次启动（含容器重建挂载同一 volume）时先扫描一次，回收停机期间超时的会话
+- 回收动作：状态置为 `expired`、记录 `expired_at`、删除全部分片记录与分片文件、删除会话目录
+- 过期后的行为：
+
+| 操作                                   | 结果                                  |
+| -------------------------------------- | ------------------------------------- |
+| `GET /uploads/{id}`（查询状态）        | `200`，仍可读，返回 `expired` 与 `expired_at` |
+| `PUT /uploads/{id}/chunks/{index}`     | `410 Gone`，响应体含 `expired_at`     |
+| `POST /uploads/{id}/complete`          | `410 Gone`，响应体含 `expired_at`     |
+| `GET /uploads/{id}/content`            | `410 Gone`（从未产生成品文件）        |
+| `GET /uploads`（会话列表）             | 过期会话**不再列入**，不可发现续传    |
+| `DELETE /uploads/{id}`                 | 正常删除（过期会话也可显式删除）      |
+
+`410` 响应示例：
+
+```json
+{
+  "detail": {
+    "message": "upload session has expired",
+    "expired_at": "2026-09-22T12:00:00.000+00:00"
+  }
+}
+```
+
+客户端收到 `410` 后需重新 `POST /uploads` 创建会话并从头上传。
+
+- 回收任务**只处理 `uploading` 状态**：`completed` 会话（即便活动时间很久）与已 `DELETE` 的会话不受影响；正在合并的会话通过每会话锁保护，不会在合并中途被误改
+- 分片上传与回收之间存在并发竞争时，以数据库条件更新为准：若上传过程中会话已被回收，则该分片不落库并返回 `410`
 
 ### 4. 合并
 
@@ -183,9 +242,11 @@ Content-Range: bytes */3000000
 
 ## 断点续传语义
 
-- 所有状态都在 `DATA_DIR` 内（SQLite + 分片文件），进程重启、容器重建（挂载同一 volume）后，未完成会话自动可用
+- 所有状态都在 `DATA_DIR` 内（SQLite + 分片文件），进程重启、容器重建（挂载同一 volume）后，未完成且未过期的会话自动可用
 - 启动时自动对账：数据库记录与磁盘分片逐一核对，缺失或尺寸不符的记录会被剔除，客户端按 `missing_chunks` 重传即可
+- 启动时先执行**过期恢复扫描**：停机期间超出空闲租约的会话会立即标记为 `expired` 并清理分片
 - 分片写入同样先写临时文件再原子改名，不存在半写的分片
+- 长时间空闲的会话会被回收（见上文「会话过期与自动回收」）；需要更长续传窗口可在创建时调大 `idle_timeout_seconds`（上限 7 天），或保持周期性状态查询以续租
 
 ## 测试
 
@@ -194,7 +255,7 @@ pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理。
+测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理，以及**空闲租约**相关：默认/上限校验、查询与上传刷新租约、后台与启动回收、过期后 `410` 与分片清理、过期会话不列可续传、已完成/已删除会话不被误回收、旧版数据库平滑迁移。
 
 ## 客户端示例（Python）
 
@@ -211,6 +272,7 @@ sid = requests.post(f"{BASE}/uploads", json={
     "total_size": size,
     "chunk_size": chunk_size,
     "file_sha256": sha,
+    "idle_timeout_seconds": 86400,  # 可选，默认 86400，上限 604800
 }).json()["session_id"]
 
 with open(path, "rb") as f:

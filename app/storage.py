@@ -1,18 +1,34 @@
-"""On-disk layout and merge logic for chunk payloads."""
+"""On-disk layout, merge logic and lease reaping for chunk payloads."""
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import shutil
 import sqlite3
+import threading
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config, db
 
+logger = logging.getLogger(__name__)
+
 _COPY_BUFFER = 1024 * 1024  # 1 MiB streaming buffer for merge/verify
+
+# Per-session locks guarding the merge. The lease reaper takes the same lock
+# (non-blocking) before expiring a session, so a session can never be marked
+# expired while its chunks are being merged.
+_merge_locks: dict[str, threading.Lock] = {}
+_merge_locks_guard = threading.Lock()
+
+
+def merge_lock(session_id: str) -> threading.Lock:
+    with _merge_locks_guard:
+        return _merge_locks.setdefault(session_id, threading.Lock())
 
 
 def sanitize_filename(name: str) -> str:
@@ -66,7 +82,8 @@ def reconcile() -> None:
     """Drop chunk rows whose payload file vanished (crash between DB and disk).
 
     Runs at startup so a restarted service reports exactly the chunks that are
-    physically present; clients simply re-upload the rest.
+    physically present; clients simply re-upload the rest. Only still-uploading
+    sessions are reconciled — completed and expired sessions are left untouched.
     """
     with db.connect() as conn:
         sessions = conn.execute(
@@ -84,6 +101,71 @@ def reconcile() -> None:
                         "DELETE FROM chunks WHERE session_id = ? AND chunk_index = ?",
                         (session["id"], row["chunk_index"]),
                     )
+
+
+class SessionExpired(Exception):
+    """Raised when an operation targets a session reaped by the lease reaper."""
+
+    def __init__(self, expired_at: str):
+        super().__init__("upload session has expired")
+        self.expired_at = expired_at
+
+
+def expire_due_sessions(now: datetime | None = None) -> list[str]:
+    """Reap uploading sessions whose idle lease has elapsed.
+
+    A session is expired when it is still ``uploading`` and
+    ``last_activity + idle_timeout_seconds`` is in the past. For each one the
+    status is flipped to ``expired`` (and ``expired_at`` stamped) inside a
+    conditional UPDATE, its chunk rows and files are removed, and the session
+    directory is deleted. Completed sessions are never touched, and deleting
+    (DELETE) removes the row entirely so a missing session is simply skipped.
+
+    The flip is atomic per session, so a chunk upload racing with the reaper
+    cannot resurrect an expired session or write chunk rows that outlive it.
+    """
+    now = now or datetime.now(timezone.utc)
+    expired_ids: list[str] = []
+    with db.connect() as conn:
+        candidates = conn.execute(
+            "SELECT * FROM sessions WHERE status = 'uploading'"
+        ).fetchall()
+        for session in candidates:
+            deadline = db.lease_deadline(
+                session["last_activity"], session["idle_timeout_seconds"]
+            )
+            if deadline > now:
+                continue
+            sid = session["id"]
+            # Never expire a session whose merge is in flight; it is about to
+            # become 'completed' and its activity is very much alive.
+            if not merge_lock(sid).acquire(blocking=False):
+                continue
+            try:
+                expired_at = db.utcnow()
+                cur = conn.execute(
+                    "UPDATE sessions SET status = 'expired', expired_at = ?, "
+                    "updated_at = ? WHERE id = ? AND status = 'uploading'",
+                    (expired_at, expired_at, sid),
+                )
+                if cur.rowcount == 0:
+                    # Completed, deleted or reaped by another worker meanwhile.
+                    continue
+                conn.execute("DELETE FROM chunks WHERE session_id = ?", (sid,))
+            finally:
+                merge_lock(sid).release()
+            expired_ids.append(sid)
+            logger.info(
+                "upload session %s expired (idle timeout %ss); removing chunks",
+                sid,
+                session["idle_timeout_seconds"],
+            )
+
+    # Disk cleanup happens after the transaction commits; a crash here leaves
+    # only harmless orphan files for a session that is already 'expired'.
+    for sid in expired_ids:
+        shutil.rmtree(session_dir(sid), ignore_errors=True)
+    return expired_ids
 
 
 class MergeError(Exception):
@@ -107,6 +189,8 @@ def merge_session(session_id: str) -> dict:
             raise KeyError(session_id)
         if session["status"] == "completed":
             return db.session_payload(conn, session)
+        if session["status"] == "expired":
+            raise SessionExpired(session["expired_at"])
         missing = db.missing_indexes(conn, session)
         if missing:
             raise MergeError(f"{len(missing)} chunk(s) still missing", missing)
@@ -173,11 +257,24 @@ def merge_session(session_id: str) -> dict:
     shutil.rmtree(session_dir(session_id), ignore_errors=True)
 
     with db.connect() as conn:
-        conn.execute("DELETE FROM chunks WHERE session_id = ?", (session_id,))
-        conn.execute(
+        cur = conn.execute(
             "UPDATE sessions SET status = 'completed', final_path = ?, "
-            "file_sha256 = ?, updated_at = ? WHERE id = ?",
+            "file_sha256 = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'uploading'",
             (str(final_path), digest, db.utcnow(), session_id),
         )
+        if cur.rowcount == 0:
+            # The session vanished (deleted) or was reaped while we merged.
+            # The merge lock normally prevents the latter, but do not publish a
+            # file that no longer has a session row to own it.
+            try:
+                final_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            current = db.get_session(conn, session_id)
+            if current is not None and current["status"] == "expired":
+                raise SessionExpired(current["expired_at"])
+            raise KeyError(session_id)
+        conn.execute("DELETE FROM chunks WHERE session_id = ?", (session_id,))
         session = db.get_session(conn, session_id)
         return db.session_payload(conn, session)

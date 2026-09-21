@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -18,21 +19,14 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import config, db, storage
 
+logger = logging.getLogger(__name__)
+
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 # One byte-range spec: "bytes=<start>-<end>", "<start>-" or "-<suffix>".
 SINGLE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 # starlette renamed its 416 constant (the old alias now warns); pin our own
 # so the whole supported fastapi/starlette range stays warning-free.
 HTTP_416_RANGE_NOT_SATISFIABLE = 416
-
-# Guards against concurrent merges of the same session.
-_merge_locks: dict[str, threading.Lock] = {}
-_merge_locks_guard = threading.Lock()
-
-
-def _merge_lock(session_id: str) -> threading.Lock:
-    with _merge_locks_guard:
-        return _merge_locks.setdefault(session_id, threading.Lock())
 
 
 @asynccontextmanager
@@ -42,10 +36,41 @@ async def lifespan(app: FastAPI):
     config.ensure_dirs()
     db.init_db()
     storage.reconcile()
-    yield
+    # Startup recovery: sessions that timed out while the process was down are
+    # reaped immediately, then the background scan takes over.
+    reaped = storage.expire_due_sessions()
+    if reaped:
+        logger.info("startup recovery expired %d idle session(s)", len(reaped))
+
+    stop_event = threading.Event()
+    reaper_thread: threading.Thread | None = None
+    if config.REAPER_INTERVAL_SECONDS > 0:
+        reaper_thread = threading.Thread(
+            target=_reaper_loop,
+            args=(stop_event, config.REAPER_INTERVAL_SECONDS),
+            name="session-reaper",
+            daemon=True,
+        )
+        reaper_thread.start()
+
+    try:
+        yield
+    finally:
+        stop_event.set()
+        if reaper_thread is not None:
+            reaper_thread.join(timeout=5)
 
 
-app = FastAPI(title="Chunked Upload Service", version="1.0.0", lifespan=lifespan)
+def _reaper_loop(stop_event: threading.Event, interval: float) -> None:
+    """Background lease reaper: periodically expire timed-out sessions."""
+    while not stop_event.wait(interval):
+        try:
+            storage.expire_due_sessions()
+        except Exception:  # never let the loop die on a transient DB/disk error
+            logger.exception("lease reaper sweep failed")
+
+
+app = FastAPI(title="Chunked Upload Service", version="1.1.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------- schemas
@@ -57,6 +82,13 @@ class CreateSessionRequest(BaseModel):
     chunk_size: int = Field(gt=0, le=config.MAX_CHUNK_SIZE)
     file_sha256: str | None = Field(
         default=None, description="Optional SHA-256 of the whole file, checked at merge"
+    )
+    idle_timeout_seconds: int = Field(
+        default=config.DEFAULT_IDLE_TIMEOUT_SECONDS,
+        ge=1,
+        le=config.MAX_IDLE_TIMEOUT_SECONDS,
+        description="Idle lease in seconds; the session expires after this many "
+        "seconds without a chunk upload or status query (max 604800)",
     )
 
     @field_validator("file_sha256")
@@ -78,6 +110,14 @@ def _get_session_or_404(session_id: str):
         if session is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
         return session
+
+
+def _expired_http(session) -> HTTPException:
+    """410 Gone for operations that can no longer touch an expired session."""
+    return HTTPException(
+        status.HTTP_410_GONE,
+        detail={"message": "upload session has expired", "expired_at": session["expired_at"]},
+    )
 
 
 def _parse_single_range(header: str, size: int) -> tuple[int, int]:
@@ -143,8 +183,9 @@ def create_session(body: CreateSessionRequest) -> dict:
     with db.connect() as conn:
         conn.execute(
             "INSERT INTO sessions (id, filename, total_size, chunk_size, "
-            "total_chunks, file_sha256, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'uploading', ?, ?)",
+            "total_chunks, file_sha256, status, idle_timeout_seconds, "
+            "last_activity, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'uploading', ?, ?, ?, ?)",
             (
                 session_id,
                 body.filename,
@@ -152,6 +193,8 @@ def create_session(body: CreateSessionRequest) -> dict:
                 body.chunk_size,
                 total_chunks,
                 body.file_sha256,
+                body.idle_timeout_seconds,
+                now,
                 now,
                 now,
             ),
@@ -162,13 +205,19 @@ def create_session(body: CreateSessionRequest) -> dict:
 
 @app.get("/uploads")
 def list_sessions() -> dict:
-    """List all sessions (most recent first) with progress counters."""
+    """List resumable sessions (most recent first) with progress counters.
+
+    Expired sessions are intentionally excluded: their chunks are gone and
+    they cannot be resumed. They remain readable via ``GET /uploads/{id}``.
+    """
     with db.connect() as conn:
         rows = conn.execute(
             "SELECT s.*, "
             "       (SELECT COUNT(*) FROM chunks c WHERE c.session_id = s.id) "
             "       AS received "
-            "FROM sessions s ORDER BY s.created_at DESC LIMIT 200"
+            "FROM sessions s "
+            "WHERE s.status != 'expired' "
+            "ORDER BY s.created_at DESC LIMIT 200"
         ).fetchall()
     return {
         "sessions": [
@@ -187,11 +236,23 @@ def list_sessions() -> dict:
 
 @app.get("/uploads/{session_id}")
 def get_session(session_id: str) -> dict:
-    """Session status, including the list of missing chunk indexes."""
+    """Session status, including the list of missing chunk indexes.
+
+    Querying a still-uploading session counts as activity and refreshes its
+    idle lease, so a client actively polling for resumption is never reaped.
+    Expired sessions remain readable but are returned as-is.
+    """
     with db.connect() as conn:
         session = db.get_session(conn, session_id)
         if session is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+        if session["status"] == "uploading":
+            conn.execute(
+                "UPDATE sessions SET last_activity = ? WHERE id = ? "
+                "AND status = 'uploading'",
+                (db.utcnow(), session_id),
+            )
+            session = db.get_session(conn, session_id)
         return db.session_payload(conn, session)
 
 
@@ -220,6 +281,8 @@ async def upload_chunk(
         session = db.get_session(conn, session_id)
     if session is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if session["status"] == "expired":
+        raise _expired_http(session)
     if session["status"] != "uploading":
         raise HTTPException(status.HTTP_409_CONFLICT, "session already completed")
     if not 0 <= index < session["total_chunks"]:
@@ -262,8 +325,21 @@ async def upload_chunk(
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "chunk sha256 mismatch")
 
-    os.replace(tmp_path, storage.chunk_path(session_id, index))
+    try:
+        os.replace(tmp_path, storage.chunk_path(session_id, index))
+    except FileNotFoundError:
+        # The reaper may have removed the session directory while the body was
+        # streaming; answer 410 instead of surfacing a 500.
+        tmp_path.unlink(missing_ok=True)
+        with db.connect() as check:
+            current = db.get_session(check, session_id)
+        if current is not None and current["status"] == "expired":
+            raise _expired_http(current)
+        raise
 
+    now = db.utcnow()
+    payload: dict | None = None
+    expired_session = None
     with db.connect() as conn:
         conn.execute(
             "INSERT INTO chunks (session_id, chunk_index, size, sha256, received_at) "
@@ -271,14 +347,31 @@ async def upload_chunk(
             "ON CONFLICT (session_id, chunk_index) DO UPDATE SET "
             "size = excluded.size, sha256 = excluded.sha256, "
             "received_at = excluded.received_at",
-            (session_id, index, size, digest, db.utcnow()),
+            (session_id, index, size, digest, now),
         )
-        conn.execute(
-            "UPDATE sessions SET updated_at = ? WHERE id = ?",
-            (db.utcnow(), session_id),
+        # A successful chunk upload renews the idle lease. The conditional
+        # status guard lets us detect if the reaper expired the session while
+        # the body was streaming; in that case roll the chunk row back and
+        # discard the just-published file below.
+        cur = conn.execute(
+            "UPDATE sessions SET updated_at = ?, last_activity = ? "
+            "WHERE id = ? AND status = 'uploading'",
+            (now, now, session_id),
         )
-        session = db.get_session(conn, session_id)
-        return db.session_payload(conn, session)
+        if cur.rowcount == 0:
+            expired_session = db.get_session(conn, session_id)
+            conn.rollback()
+        else:
+            session = db.get_session(conn, session_id)
+            payload = db.session_payload(conn, session)
+
+    if payload is not None:
+        return payload
+    # Lost the race: the session was expired by the reaper or deleted.
+    storage.chunk_path(session_id, index).unlink(missing_ok=True)
+    if expired_session is not None and expired_session["status"] == "expired":
+        raise _expired_http(expired_session)
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
 
 
 @app.post("/uploads/{session_id}/complete")
@@ -289,7 +382,7 @@ def complete_session(session_id: str) -> dict:
     chunk's hash is re-verified during the merge, and the target file is
     published atomically via rename.
     """
-    lock = _merge_lock(session_id)
+    lock = storage.merge_lock(session_id)
     if not lock.acquire(blocking=False):
         raise HTTPException(
             status.HTTP_409_CONFLICT, "a merge is already in progress for this session"
@@ -299,6 +392,14 @@ def complete_session(session_id: str) -> dict:
             return storage.merge_session(session_id)
         except KeyError:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+        except storage.SessionExpired as exc:
+            raise HTTPException(
+                status.HTTP_410_GONE,
+                detail={
+                    "message": "upload session has expired",
+                    "expired_at": exc.expired_at,
+                },
+            )
         except storage.MergeError as exc:
             code = (
                 status.HTTP_409_CONFLICT
@@ -333,6 +434,8 @@ def download_content(
         session = db.get_session(conn, session_id)
     if session is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if session["status"] == "expired":
+        raise _expired_http(session)
     if session["status"] != "completed" or not session["final_path"]:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
