@@ -1,0 +1,13 @@
+services:
+  uploader:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - upload-data:/data
+    restart: unless-stopped
+
+volumes:
+  upload-data:
