@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 # Point storage at a throwaway directory BEFORE importing the app.
 _TMP = tempfile.mkdtemp(prefix="chunked-upload-test-")
@@ -15,6 +17,7 @@ os.environ["DATA_DIR"] = _TMP
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import config, db, storage  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -299,3 +302,267 @@ def test_download_session_state_errors():
         assert client.get(f"/uploads/{sid}/content").status_code == 409
         assert _put(client, sid, 0, chunks[0]).status_code == 200
         assert client.get(f"/uploads/{sid}/content").status_code == 409
+
+
+# ------------------------------------------------------------- session leases
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _set_last_activity(sid: str, dt: datetime) -> None:
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE sessions SET last_activity = ? WHERE id = ?", (_iso(dt), sid)
+        )
+
+
+def test_idle_lease_defaults_and_limits():
+    with TestClient(app) as client:
+        data, _ = _make_file(256, total_chunks=1, last_size=256)
+
+        session = _create(client, data, 256)
+        assert session["idle_timeout_seconds"] == 86400
+        assert session["status"] == "uploading"
+        assert session["expired_at"] is None
+        # expires_at is the projected lease deadline = last_activity + timeout.
+        last = datetime.fromisoformat(session["last_activity"])
+        assert datetime.fromisoformat(session["expires_at"]) == last + timedelta(
+            seconds=86400
+        )
+
+        # Explicit, in-range lease.
+        short = _create(client, data, 256, idle_timeout_seconds=60)
+        assert short["idle_timeout_seconds"] == 60
+
+        # Out-of-range / invalid leases are rejected at creation.
+        for bad in (0, -5, 604801, 10**9):
+            resp = client.post(
+                "/uploads",
+                json={
+                    "filename": "sample.bin",
+                    "total_size": len(data),
+                    "chunk_size": 256,
+                    "idle_timeout_seconds": bad,
+                },
+            )
+            assert resp.status_code == 422, bad
+
+
+def test_reaper_marks_stale_session_expired_and_clears_chunks():
+    with TestClient(app) as client:
+        data, chunks = _make_file(256, total_chunks=2, last_size=256)
+        sid = _create(client, data, 256, idle_timeout_seconds=60)["session_id"]
+        assert _put(client, sid, 0, chunks[0]).status_code == 200
+        chunk_file = storage.chunk_path(sid, 0)
+        assert chunk_file.is_file()
+
+        # Idle within the lease: nothing happens.
+        _set_last_activity(sid, datetime.now(timezone.utc) - timedelta(seconds=30))
+        assert storage.expire_idle_sessions() == []
+        assert client.get(f"/uploads/{sid}").json()["status"] == "uploading"
+        assert chunk_file.is_file()
+
+        # Past the lease: expired, with expired_at recorded and chunks gone.
+        expiry = datetime.now(timezone.utc) - timedelta(seconds=1)
+        _set_last_activity(sid, expiry - timedelta(seconds=60))
+        reaped = storage.expire_idle_sessions(now=expiry)
+        assert reaped == [sid]
+        assert not chunk_file.exists()
+        with db.connect() as conn:
+            assert db.received_indexes(conn, sid) == set()
+
+        state = client.get(f"/uploads/{sid}").json()
+        assert state["status"] == "expired"
+        assert state["expired_at"] == _iso(expiry)
+        assert state["missing_chunks"] == []
+        assert state["received_count"] == 0
+        assert state["expires_at"] is None
+
+        # Upload and complete are 410 Gone carrying expired_at.
+        gone = _put(client, sid, 1, chunks[1])
+        assert gone.status_code == 410
+        assert gone.json()["detail"]["expired_at"] == _iso(expiry)
+        done = client.post(f"/uploads/{sid}/complete")
+        assert done.status_code == 410
+        assert done.json()["detail"]["expired_at"] == _iso(expiry)
+
+        # Reaping again is idempotent; expired rows are not touched.
+        assert storage.expire_idle_sessions() == []
+
+        # Expired sessions are omitted from the resumable list.
+        ids = [s["session_id"] for s in client.get("/uploads").json()["sessions"]]
+        assert sid not in ids
+
+
+def test_chunk_upload_and_status_query_refresh_lease():
+    with TestClient(app) as client:
+        data, chunks = _make_file(256, total_chunks=2, last_size=256)
+        sid = _create(client, data, 256, idle_timeout_seconds=60)["session_id"]
+
+        stale = datetime.now(timezone.utc) - timedelta(seconds=59)
+        _set_last_activity(sid, stale)
+
+        # A status query counts as activity and pushes the deadline forward.
+        resp = client.get(f"/uploads/{sid}")
+        assert resp.status_code == 200
+        last_after_query = datetime.fromisoformat(resp.json()["last_activity"])
+        assert last_after_query > stale
+        assert storage.expire_idle_sessions() == []
+
+        # A successful chunk upload refreshes the lease as well.
+        _set_last_activity(sid, stale)
+        assert _put(client, sid, 0, chunks[0]).status_code == 200
+        state = client.get(f"/uploads/{sid}").json()
+        assert datetime.fromisoformat(state["last_activity"]) > stale
+        assert storage.expire_idle_sessions() == []
+        assert state["status"] == "uploading"
+
+
+def test_completed_sessions_are_never_reaped():
+    with TestClient(app) as client:
+        data, _ = _make_file(256, total_chunks=2, last_size=256)
+        done = _completed(client, data, 256)
+        sid = done["session_id"]
+        # Completed ages ago would be "idle" by any measure; it must survive.
+        old = datetime.now(timezone.utc) - timedelta(days=30)
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET last_activity = ?, updated_at = ? WHERE id = ?",
+                (_iso(old), _iso(old), sid),
+            )
+        assert storage.expire_idle_sessions() == []
+        body = client.get(f"/uploads/{sid}").json()
+        assert body["status"] == "completed"
+        assert os.path.isfile(done["final_path"])
+        assert client.get(f"/uploads/{sid}/content").status_code == 200
+
+
+def test_reaper_skips_session_currently_merging():
+    with TestClient(app) as client:
+        data, _ = _make_file(256, total_chunks=2, last_size=256)
+        sid = _create(client, data, 256, idle_timeout_seconds=1)["session_id"]
+        _set_last_activity(sid, datetime.now(timezone.utc) - timedelta(hours=1))
+
+        lock = storage.merge_lock(sid)
+        assert lock.acquire(blocking=False)
+        try:
+            assert storage.expire_idle_sessions() == []
+            with db.connect() as conn:
+                assert db.get_session(conn, sid)["status"] == "uploading"
+        finally:
+            lock.release()
+
+        # Once the merge finishes (lock released), the reaper may reap it.
+        assert storage.expire_idle_sessions() == [sid]
+
+
+def test_deleted_sessions_are_not_reaped():
+    with TestClient(app) as client:
+        data, chunks = _make_file(256, total_chunks=2, last_size=256)
+        sid = _create(client, data, 256, idle_timeout_seconds=1)["session_id"]
+        assert _put(client, sid, 0, chunks[0]).status_code == 200
+        assert client.delete(f"/uploads/{sid}").status_code == 204
+        _set_last_activity(sid, datetime.now(timezone.utc) - timedelta(hours=1))
+        # Row is gone; the sweep simply has nothing to expire.
+        assert storage.expire_idle_sessions() == []
+        assert client.get(f"/uploads/{sid}").status_code == 404
+
+
+def test_startup_recovery_sweep_expires_stale_sessions():
+    data, chunks = _make_file(256, total_chunks=2, last_size=256)
+    stale_sid = fresh_sid = None
+
+    # First boot: create one stale and one still-leased session.
+    with TestClient(app) as client:
+        stale_sid = _create(client, data, 256, idle_timeout_seconds=60)["session_id"]
+        assert _put(client, stale_sid, 0, chunks[0]).status_code == 200
+        _set_last_activity(
+            stale_sid, datetime.now(timezone.utc) - timedelta(seconds=61)
+        )
+        fresh_sid = _create(client, data, 256, idle_timeout_seconds=3600)["session_id"]
+        assert _put(client, fresh_sid, 0, chunks[0]).status_code == 200
+
+    # Second boot: the lifespan recovery sweep must expire the stale one and
+    # leave the fresh session resumable.
+    with TestClient(app) as client:
+        stale = client.get(f"/uploads/{stale_sid}").json()
+        assert stale["status"] == "expired"
+        assert stale["expired_at"] is not None
+        assert not storage.chunk_path(stale_sid, 0).exists()
+        assert client.post(f"/uploads/{stale_sid}/complete").status_code == 410
+
+        fresh = client.get(f"/uploads/{fresh_sid}").json()
+        assert fresh["status"] == "uploading"
+        assert fresh["missing_chunks"] == [1]
+        assert _put(client, fresh_sid, 1, chunks[1]).status_code == 200
+        done = client.post(f"/uploads/{fresh_sid}/complete")
+        assert done.status_code == 200, done.text
+
+
+def test_init_db_migrates_pre_lease_database():
+    # Hand-build a database from the pre-lease schema (no lease columns and
+    # the old status CHECK), then let init_db() migrate it in place.
+    migrated_dir = tempfile.mkdtemp(prefix="chunked-upload-migrate-")
+    db_path = os.path.join(migrated_dir, "uploads.db")
+    created = old_updated = _iso(datetime.now(timezone.utc) - timedelta(days=2))
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                total_size INTEGER NOT NULL,
+                chunk_size INTEGER NOT NULL,
+                total_chunks INTEGER NOT NULL,
+                file_sha256 TEXT,
+                status TEXT NOT NULL DEFAULT 'uploading'
+                    CHECK (status IN ('uploading', 'completed')),
+                final_path TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE chunks (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, chunk_index)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, filename, total_size, chunk_size, "
+            "total_chunks, status, created_at, updated_at) "
+            "VALUES ('old1', 'a.bin', 256, 256, 1, 'uploading', ?, ?)",
+            (created, old_updated),
+        )
+        conn.execute(
+            "INSERT INTO chunks (session_id, chunk_index, size, sha256, received_at) "
+            "VALUES ('old1', 0, 256, ?, ?)",
+            ("a" * 64, old_updated),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    original = config.DB_PATH
+    config.DB_PATH = type(original)(db_path)
+    try:
+        db.init_db()
+        with db.connect() as migrated:
+            row = db.get_session(migrated, "old1")
+            assert row is not None
+            assert row["idle_timeout_seconds"] == config.DEFAULT_IDLE_TIMEOUT_SECONDS
+            assert row["last_activity"] == old_updated
+            assert row["expired_at"] is None
+            # Chunk rows and the FK survive the rebuild.
+            assert db.received_indexes(migrated, "old1") == {0}
+        # Migration is idempotent: a second init is a no-op.
+        db.init_db()
+    finally:
+        config.DB_PATH = original
+

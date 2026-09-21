@@ -19,6 +19,18 @@ PORT = int(os.environ.get("PORT", "8000"))
 # Upper bound for a single chunk (64 MiB) to avoid pathological allocations.
 MAX_CHUNK_SIZE = 64 * 1024 * 1024
 
+# Upload-session lease defaults. A session with no successful chunk upload or
+# status query for IDLE_TIMEOUT seconds is expired by the background reaper
+# (and by the startup recovery sweep); clients may request a shorter lease at
+# creation, up to MAX_IDLE_TIMEOUT.
+DEFAULT_IDLE_TIMEOUT_SECONDS = 24 * 60 * 60       # 1 day
+MAX_IDLE_TIMEOUT_SECONDS = 7 * 24 * 60 * 60       # 7 days
+
+# How often the background reaper scans for idle sessions (seconds).
+REAPER_INTERVAL_SECONDS = max(
+    1.0, float(os.environ.get("REAPER_INTERVAL_SECONDS", "300"))
+)
+
 DB_PATH = DATA_DIR / DB_FILENAME
 
 
